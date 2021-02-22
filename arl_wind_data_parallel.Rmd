@@ -1,0 +1,162 @@
+---
+title: "ARL Wind data processing"
+author: "Maggie Klope"
+date: "2/10/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(raster)
+library(tidyverse)
+# devtools::install_github('uataq/stiltread')
+library(stiltread) # for reading ARL packed data files
+library(lubridate)
+library(sf)
+# library(here)
+library(leaflet)
+library(ggspatial)
+library(rgdal)
+# library(microbenchmark)
+library(foreach)
+library(raster)
+library(doParallel)  # for running foreach loops in parallel
+
+```
+
+## Workflow Outline:
+
+1. Download and read ARL data from (NOAA) [https://ready.arl.noaa.gov/data/archives/wrf27km/inst/]
+2. Calculate wind speed and direction for each hour in each ecoregion
+3. Convert time from UCT to PST
+4. Calculate daily averages by ecoregion
+
+## Download and read ARL data
+
+- Can use the terminal and wget
+  - can create a folder for each year folders using ``for i in {1980..2001}; do mkdir $i; done;``
+- We also developed an R script to download files. It is saved as `arl_download_script.R` in this repository
+  - Currently set to download years 1980-2001
+  - Because this method will attempt to download ARL files for days that do not exist (ex: February 30th), we added a line of code that checks the file size and then deletes these temp files
+  
+## Final Workflow: Parallelized across years
+
+- This example goes through multiple years in parallel.
+- The first loop, 'files', goes through each year's folder and creates a list of the file paths. We did this to remove the nested foreach() loops and to eliminate the need for changing the working directory in the loop.
+- This loop also saves directly as a data frame, removing the need to convert it outside the loop.
+
+```{r, eval=FALSE}
+# Path to the raw data
+data_raw_dir <- "~/arl-files"
+
+# setting the years to evaluate
+start_year <- 1981
+end_year <- 1982
+
+# Compute all years
+years <- start_year:end_year
+
+# first loop to get file paths for each ARL file
+files <- foreach(file_year = years, .combine = c)  %do% {
+  
+  # setting the folder 
+  folder <- file.path(data_raw_dir, file_year)
+  
+  # making list of input files in each folder
+  list.files(folder, full.names = TRUE)
+  
+}
+
+# # optional subsetting files to increase testing speed
+# files <- files[365:366] # if you want to test with 2 files
+# files <- files[360:370] # if you want to test with 10 files
+
+# load ecoregion shapefile
+ecoregions <- read_sf(dsn = "ecoregion", layer = "Climate_eco_v2")
+
+# start cluster
+nb_cores <- 18  # Aurora has 96 cores
+cl <- parallel::makeCluster(nb_cores) 
+doParallel::registerDoParallel(cl)
+
+# We are used Sys.time() to get times stamps to measure how long the process took with parallelization
+# first time stamp
+time_1 <- Sys.time()
+
+# workflow loop
+df <-  foreach(arl = files, .combine = rbind) %:% foreach(hh = 0:23, .packages = c("dplyr","raster", "tidyr", "stiltread"), .combine = rbind) %dopar% {
+  
+  # getting date and time information from ARL filename
+  date <- strsplit(arl, "[_.]")[[1]][3]
+  yy <- substr(date, 3,4)
+  mm <- substr(date, 5,6)
+  dd <- substr(date, 7,8)
+      
+  # time conversion from UTC to PST
+  hour = paste(hh, ":00", sep = "")
+  temp_time <- paste(yy, "-", mm, "-", dd, " ", hour, ":00", sep = "")
+  utc_time <- lubridate::ymd_hms(temp_time)
+  pst_time <- lubridate::with_tz(utc_time, tzone = "America/Los_Angeles") 
+  
+  # load ARL data
+  uv <-  stiltread::read_met_wind(arl,
+                       yy = yy,
+                       mm = mm,
+                       dd = dd,
+                       hh = hh,
+                       lvl = 0)
+  
+  # re-project to match the ecoregions shapefile projection
+  u_geog <- projectRaster(uv$u, crs = crs(ecoregions))
+  v_geog <- projectRaster(uv$v, crs = crs(ecoregions))
+
+  # crop to shapefile to remove excess data
+  u_geog_cr <- crop(u_geog, ecoregions, snap = "out") #set snap = "out" so there are no missing pixels
+  v_geog_cr <- crop(v_geog, ecoregions, snap = "out")
+    
+  # wind speed calculations done before extracting ecoregion mean
+  wind_speed_test <- sqrt((u_geog_cr * u_geog_cr) + (v_geog_cr * v_geog_cr)) #calculation
+  wind_speed_extract <- raster::extract(wind_speed_test, ecoregions, cellnumbers = TRUE, df = TRUE, fun = mean, na.rm = TRUE) #extracting the mean
+
+  # wind_direction
+  wind_direction <- 180 + (180/pi) * (atan2(v_geog_cr, u_geog_cr)) #calculation
+  wind_direction_extract <- raster::extract(wind_direction, ecoregions, cellnumbers = TRUE, df = TRUE, fun = mean, na.rm = TRUE) #extracting the mean
+
+  # transpose
+  wind_speed_extract <- wind_speed_extract %>%
+    pivot_wider(names_from = ID, values_from = layer) 
+
+  wind_direction_extract <- wind_direction_extract %>%
+    pivot_wider(names_from = ID, values_from = layer) 
+  
+  # join data together and save as dataframe
+  data.frame(file_name = arl,
+             time_utc = temp_time,
+             time_pst = pst_time, 
+             wind_speed = wind_speed_extract,
+             wind_direction = wind_direction_extract)
+  
+  }
+
+# time step 2
+time_2 <- Sys.time()
+
+# elapsed time
+time_2 - time_1
+
+# stop cluster
+parallel::stopCluster(cl)
+
+# get daily means based off of PST time
+df_PST_mean <- df %>% 
+  group_by(day = floor_date(time_pst, "day")) %>%
+  mutate_at(vars(wind_speed.1:wind_direction.10), as.numeric) %>% 
+  summarize_at(vars(wind_speed.1:wind_direction.10), mean)
+
+# saving original and daily mean dataframes as .csv files
+write_csv(df, "df.csv")
+write_csv(df_PST_mean, "df_PST_mean.csv")
+
+```
